@@ -1,0 +1,111 @@
+services:
+  elastic_setup_generate_certs:
+    image: elasticsearch:${BUILD_VERSION}
+    container_name: elastic_setup_generate_certs
+    environment:
+      - HOSTNAME=${HOSTNAME}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    entrypoint: /bin/bash
+    command: >
+      -c 'echo "Generating Certificates... or failing if they already exist which is fine."
+        echo -e "instances:\n  - name: \"elasticsearch\"\n    dns:\n      - \"localhost\"\n      - \"elasticsearch\"\n      - \"$${HOSTNAME}\"\n  - name: \"kibana\"\n    dns:\n      - \"localhost\"\n      - \"kibana\"\n      - \"$${HOSTNAME}\"\n  - name: \"fleet-server\"\n    dns:\n      - \"localhost\"\n      - \"fleet-server\"\n      - \"$${HOSTNAME}\"" > instances.yml
+        bin/elasticsearch-certutil ca --pem --out config/certs/ca_bundle.zip --silent
+        unzip config/certs/ca_bundle.zip -d config/certs
+        bin/elasticsearch-certutil cert --in instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key --pem --out config/certs/bundle.zip --silent
+        unzip config/certs/bundle.zip -d config/certs
+        chown -R 1000:0 config/certs
+      '
+    
+  elasticsearch:
+    image: elasticsearch:${BUILD_VERSION}
+    container_name: elasticsearch 
+    environment:
+      - discovery.type=single-node
+      - node.name=elasticsearch
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.key
+      - xpack.security.http.ssl.certificate=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.crt
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+      - certs:/usr/share/elasticsearch/config/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} --cacert /usr/share/elasticsearch/config/certs/ca/ca.crt -f https://localhost:9200/_cluster/health?local=true | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      elastic_setup_generate_certs:
+        condition: service_completed_successfully
+    
+  elastic_setup_change_kibana_pass:
+    image: elasticsearch:${BUILD_VERSION}
+    container_name: elastic_setup_change_kibana_pass
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - KIBANA_SYSTEM_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
+    user: "0"
+    command: >
+      bash -c '
+        echo "Waiting for Elasticsearch to be healthy..."
+        until curl -s -u elastic:$${ELASTIC_PASSWORD} --cacert /usr/share/elasticsearch/config/certs/ca/ca.crt --insecure https://elasticsearch:9200; do sleep 5; done;
+        
+        echo "Setting kibana_system password..."
+        curl -X POST -u "elastic:$${ELASTIC_PASSWORD}" --cacert /usr/share/elasticsearch/config/certs/ca/ca.crt --insecure -H "Content-Type: application/json" -d "{\"password\":\"$${KIBANA_SYSTEM_PASSWORD}\"}" https://elasticsearch:9200/_security/user/kibana_system/_password
+      '
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  kibana:
+    image: kibana:${BUILD_VERSION}
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=https://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+      # TLS between Kibana and ES
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=/usr/share/kibana/config/certs/ca/ca.crt
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=certificate
+      # TLS between Kibana and Users' browsers
+      - SERVER_SSL_ENABLED=true
+      - SERVER_SSL_CERTIFICATE=/usr/share/kibana/config/certs/kibana/kibana.crt
+      - SERVER_SSL_KEY=/usr/share/kibana/config/certs/kibana/kibana.key
+      # etc
+      - XPACK_SECURITY_ENCRYPTIONKEY=${XPACK_SECURITY_ENCRYPTIONKEY}
+      - XPACK_REPORTING_ENCRYPTIONKEY=${XPACK_REPORTING_ENCRYPTIONKEY}
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY}
+      # fleet server settings
+      # - XPACK_FLEET_AGENTS_ELASTICSEARCH_HOSTS=["https://${HOSTNAME}:9200"]
+      # - XPACK_FLEET_AGENTS_FLEET_SERVER_HOSTS=["https://${HOSTNAME}:8220"]
+      - XPACK_FLEET_ISAIRGAPPED=true
+      # - XPACK_FLEET_AGENTS_ELASTICSEARCH_CA_SHA256=CukWYy3J73o0Sts76igXl35hinPageAbeRrx2dnlw8o=
+    volumes:
+      - kibana_data:/usr/share/kibana/data
+      - certs:/usr/share/kibana/config/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --cacert /usr/share/kibana/config/certs/kibana/kibana.crt --insecure -f https://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      elastic_setup_change_kibana_pass:
+        condition: service_completed_successfully
+
+volumes:
+  certs:
+  es_data:
+  kibana_data:
